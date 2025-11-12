@@ -1,0 +1,13 @@
+# Ignore everything by default
+*
+
+# Allow .gitignore so this file stays tracked
+!.gitignore
+
+# Allow directory traversal and Python source
+!*/
+!*.py
+
+# Always ignore Python cache artifacts
+__pycache__/
+*.py[cod]
