@@ -2,8 +2,8 @@
 
 # FUCCI 多帧细胞检测器
 # 复用原 SEP→LoG→局部极大值参数，对每个 ets 的所有时间帧和前两个荧光通道进行计数
-# 支持 RFP 优先的跨通道去重、逐帧进度日志、统计九个位置的均值/方差
-# 同时生成可在 FIJI 打开的 *_marked.ome.tif（包含原图与标记遮罩）及 Excel 汇总
+# 最新改动：取消 Excel 汇总，新增逐帧 CSV（按 `_Image_*` 解析出的 A1_01 等编号命名），处理流程重构为
+#   _iter_stack_files + process_frame_file 的双层结构并提供控制台汇总；按需生成 FIJI 友好的 *_marked.ome.tif
 
 # =============== REQUIRED PACKAGES =========================================================================================
 
@@ -17,7 +17,6 @@ import glob # finds all the pathnames matching a specified pattern according to 
 from tqdm import tqdm # to get a processing bar in the terminal
 from scipy.spatial import KDTree
 import numpy as np
-import openpyxl # for Excel output
 import re # for pattern matching
 import traceback
 import tifffile
@@ -46,6 +45,8 @@ merge_distance=3
 MARKED_STACK_SUFFIX="_marked"
 DEFAULT_MARKED_DIR=os.path.dirname(os.path.abspath(__file__))
 ENABLE_MARKED_OUTPUT=False  # 批量运行时可临时改为 False 以跳过生成 OME-TIFF
+PER_FRAME_COUNTS_DIR_NAME="per_frame_counts"
+PER_FRAME_COUNTS_SUFFIX="_frame_counts.csv"
 
 
 # =============== HELPER FUNCTIONS =========================================================================================
@@ -56,6 +57,55 @@ def _reshape_plane(yy, Nx, Ny, channel_idx):
         yy = yy[:, :, channel_idx]
     data = yy.reshape(Ny, Nx)
     return np.ascontiguousarray(data)
+
+
+def _infer_image_identifier(frame_file):
+    stack_dir = os.path.dirname(frame_file)
+    image_dir = os.path.dirname(stack_dir)
+    folder_name = os.path.basename(image_dir)
+    match = re.search(r'_Image_([A-Z]\d+)_(\d+)_', folder_name)
+    if match:
+        return f"{match.group(1)}_{match.group(2)}"
+    return os.path.splitext(os.path.basename(frame_file))[0]
+
+
+def _extract_puits_position(folder_name):
+    match = re.search(r'_Image_([A-Z]\d+)_(\d+)_', folder_name)
+    if match:
+        return match.group(1), int(match.group(2))
+    return None, None
+
+
+def _iter_stack_files(base_dir):
+    for root, dirs, _ in os.walk(base_dir):
+        for dir_name in dirs:
+            if not (dir_name.startswith("_Image_") and dir_name.endswith("__")):
+                continue
+            stack_path = os.path.join(root, dir_name, "stack1")
+            if not os.path.exists(stack_path):
+                continue
+            for ets_path in sorted(glob.glob(os.path.join(stack_path, "*.ets"))):
+                yield dir_name, ets_path
+
+
+def _print_run_summary(records):
+    if not records:
+        print("\n未处理任何 ets 文件。")
+        return
+
+    print("\n处理汇总:")
+    for rec in records:
+        puits = rec.get("puits", "?")
+        pos = rec.get("position")
+        gfp = rec.get("channel_0", 0)
+        rfp = rec.get("channel_1", 0)
+        counts_csv = rec.get("counts_csv") or "-"
+        marked_stack = rec.get("marked_stack") or "-"
+        pos_str = f"{pos:02d}" if isinstance(pos, int) else "?"
+        print(
+            f"  {puits}#{pos_str} | last(GFP,RFP)=({gfp}, {rfp}) | "
+            f"counts: {counts_csv} | marked: {marked_stack}"
+        )
 
 
 def _detect_positions(data, background):
@@ -188,77 +238,61 @@ class MarkedStackWriter:
 
 # =============== MAIN FUNCTION =========================================================================================
 
-def process_folders(base_directories, output_excel_path):
-    """
-    处理多个文件夹中的frame文件
-    
-    Args:
-        base_directories: 包含要处理文件夹的目录列表
-        output_excel_path: Excel输出文件路径
-    """
-    
-    # 初始化结果字典
-    results = {}
-    
-    # 启动Java虚拟机以访问图像
+def process_folders(base_directories, output_excel_path=None):
+    """批量处理多个目录中的 ets 文件，并打印汇总信息。"""
+
+    if output_excel_path:
+        print(f"[提示] Excel 汇总已取消，忽略路径: {output_excel_path}")
+
+    summary_records = []
+
     javabridge.start_vm(class_path=bioformats.JARS)
-    
+
     try:
         for base_dir in base_directories:
             print(f"处理目录: {base_dir}")
-            
-            # 查找所有包含frame文件的文件夹
-            frame_folders = []
-            for root, dirs, files in os.walk(base_dir):
-                for dir_name in dirs:
-                    if dir_name.startswith("_Image_") and dir_name.endswith("__"):
-                        frame_path = os.path.join(root, dir_name, "stack1")
-                        if os.path.exists(frame_path):
-                            # 查找.ets文件
-                            ets_files = glob.glob(os.path.join(frame_path, "*.ets"))
-                            if ets_files:
-                                frame_folders.append((dir_name, ets_files[0]))
-            
-            print(f"找到 {len(frame_folders)} 个frame文件夹")
-            
-            # 处理每个frame文件夹
-            for folder_name, frame_file in tqdm(frame_folders, desc=f"处理 {os.path.basename(base_dir)}"):
-                # 解析puits和位置信息
-                # 例如: _Image_A1_01_F98_Fucci__ -> A1, 01
-                match = re.search(r'_Image_([A-Z]\d+)_(\d+)_', folder_name)
-                if match:
-                    puits = match.group(1)  # A1, A2, etc.
-                    position = int(match.group(2))  # 01, 02, etc.
-                else:
+            frame_entries = list(_iter_stack_files(base_dir))
+            if not frame_entries:
+                print("  ⚠️ 未发现 ets 文件")
+                continue
+
+            print(f"找到 {len(frame_entries)} 个frame文件夹")
+
+            for folder_name, frame_file in tqdm(frame_entries, desc=f"处理 {os.path.basename(base_dir)}"):
+                puits, position = _extract_puits_position(folder_name)
+                if puits is None:
                     print(f"无法解析文件夹名称: {folder_name}")
                     continue
-                
-                # 处理frame文件
-                cell_counts = process_frame_file(frame_file)
-                
-                # 存储结果
-                if puits not in results:
-                    results[puits] = {}
-                
-                results[puits][position] = cell_counts
-                
+
+                result = process_frame_file(frame_file)
+                summary_records.append({
+                    "puits": puits,
+                    "position": position,
+                    "file": frame_file,
+                    "channel_0": result.get("channel_0", 0),
+                    "channel_1": result.get("channel_1", 0),
+                    "counts_csv": result.get("counts_csv"),
+                    "marked_stack": result.get("marked_stack")
+                })
     finally:
-        # 关闭Java虚拟机
         javabridge.kill_vm()
-    
-    # 计算统计信息并输出到Excel
-    calculate_and_save_statistics(results, output_excel_path)
+
+    _print_run_summary(summary_records)
+    return summary_records
 
 def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=None):
-    """处理单个frame文件，对所有时间帧和前两个通道进行检测并输出标注。"""
+    """处理单个 ets 文件，返回最后一帧计数及逐帧统计的保存路径。"""
     print(f"处理文件: {frame_file}")
 
     frames_summary = {}
     marked_stack_path = None
     marked_output_dir = marked_output_dir or DEFAULT_MARKED_DIR
+    per_frame_counts_dir = os.path.join(marked_output_dir, PER_FRAME_COUNTS_DIR_NAME)
+    os.makedirs(per_frame_counts_dir, exist_ok=True)
     writer = None
     reader = None
     marked_output_path = None
+    counts_output_path = None
 
     try:
         ome = bioformats.OMEXML(bioformats.get_omexml_metadata(frame_file))
@@ -271,10 +305,18 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
 
         if nt == 0:
             print("警告: 没有时间帧")
-            return {"channel_0": 0, "channel_1": 0, "frames": frames_summary, "marked_stack": None}
+            return {
+                "channel_0": 0,
+                "channel_1": 0,
+                "frames": frames_summary,
+                "marked_stack": None,
+                "counts_csv": None
+            }
 
         reader = bioformats.ImageReader(frame_file)
-        base_name = os.path.splitext(os.path.basename(frame_file))[0]
+        fallback_name = os.path.splitext(os.path.basename(frame_file))[0]
+        identifier = _infer_image_identifier(frame_file)
+        base_output_name = identifier or fallback_name
         marked_output_path = None
         detection_channels = list(range(min(2, nchan)))
         total_channels = nchan + len(detection_channels)
@@ -282,7 +324,7 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
             f"channel_{idx}_marks" for idx in detection_channels
         ]
         if ENABLE_MARKED_OUTPUT:
-            marked_output_path = os.path.join(marked_output_dir, f"{base_name}{MARKED_STACK_SUFFIX}.ome.tif")
+            marked_output_path = os.path.join(marked_output_dir, f"{base_output_name}{MARKED_STACK_SUFFIX}.ome.tif")
 
         for frame_idx in range(nt):
             try:
@@ -374,6 +416,26 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
             f"RFP总计: {merged_rfp}"
         )
 
+        records = []
+        for frame_idx in range(nt):
+            info = frames_summary.get(frame_idx, {})
+            raw_counts = info.get("raw_counts", {})
+            merged_counts = info.get("merged_counts", {})
+            records.append({
+                "frame": frame_idx,
+                "raw_channel_0": raw_counts.get("channel_0", 0),
+                "raw_channel_1": raw_counts.get("channel_1", 0),
+                "merged_channel_0": merged_counts.get("channel_0", 0),
+                "merged_channel_1": merged_counts.get("channel_1", 0),
+                "merged_total": info.get("merged_total", 0),
+                "error": info.get("error", "")
+            })
+
+        counts_df = pandas.DataFrame.from_records(records)
+        counts_output_path = os.path.join(per_frame_counts_dir, f"{base_output_name}{PER_FRAME_COUNTS_SUFFIX}")
+        counts_df.to_csv(counts_output_path, index=False)
+        print(f"逐帧统计: {counts_output_path}")
+
         last_frame_summary = frames_summary.get(nt - 1, {
             "merged_counts": {"channel_0": 0, "channel_1": 0}
         })
@@ -381,7 +443,8 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
             "channel_0": last_frame_summary["merged_counts"].get("channel_0", 0),
             "channel_1": last_frame_summary["merged_counts"].get("channel_1", 0),
             "frames": frames_summary,
-            "marked_stack": marked_stack_path
+            "marked_stack": marked_stack_path,
+            "counts_csv": counts_output_path
         }
         if ENABLE_MARKED_OUTPUT:
             print(f"标注输出: {marked_stack_path if marked_stack_path else '未生成'}")
@@ -392,76 +455,18 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
     except Exception as e:
         print(f"处理文件 {frame_file} 时出错: {str(e)}")
         traceback.print_exc()
-        return {"channel_0": 0, "channel_1": 0, "frames": frames_summary, "marked_stack": None}
+        return {
+            "channel_0": 0,
+            "channel_1": 0,
+            "frames": frames_summary,
+            "marked_stack": None,
+            "counts_csv": counts_output_path
+        }
     finally:
         if reader is not None:
             reader.close()
         if writer is not None:
             writer.close()
-
-def calculate_and_save_statistics(results, output_excel_path):
-    """
-    计算每个puits的统计信息并保存到Excel
-    
-    Args:
-        results: 包含所有结果的字典
-        output_excel_path: Excel输出文件路径
-    """
-    print("计算统计信息...")
-    
-    # 创建Excel工作簿
-    wb = openpyxl.Workbook()
-    
-    # 为每个通道创建工作表
-    for channel_idx in range(2):
-        ws = wb.create_sheet(title=f"Channel_{channel_idx}")
-        
-        # 设置标题行
-        headers = ["Puits", "Position_01", "Position_02", "Position_03", "Position_04", 
-                  "Position_05", "Position_06", "Position_07", "Position_08", "Position_09", 
-                  "Mean", "Std"]
-        
-        for col, header in enumerate(headers, 1):
-            ws.cell(row=1, column=col, value=header)
-        
-        # 填充数据
-        row = 2
-        for puits in sorted(results.keys()):
-            puits_data = results[puits]
-            
-            # 收集九个位置的数据
-            position_counts = []
-            for pos in range(1, 10):  # 01到09
-                if pos in puits_data:
-                    count = puits_data[pos].get(f"channel_{channel_idx}", 0)
-                    position_counts.append(count)
-                else:
-                    position_counts.append(0)
-            
-            # 计算平均值和标准差
-            if position_counts:
-                mean_val = np.mean(position_counts)
-                std_val = np.std(position_counts, ddof=1)  # 样本标准差
-            else:
-                mean_val = 0
-                std_val = 0
-            
-            # 写入数据
-            ws.cell(row=row, column=1, value=puits)
-            for col, count in enumerate(position_counts, 2):
-                ws.cell(row=row, column=col, value=count)
-            ws.cell(row=row, column=11, value=mean_val)
-            ws.cell(row=row, column=12, value=std_val)
-            
-            row += 1
-    
-    # 删除默认工作表
-    if "Sheet" in wb.sheetnames:
-        wb.remove(wb["Sheet"])
-    
-    # 保存Excel文件
-    wb.save(output_excel_path)
-    print(f"结果已保存到: {output_excel_path}")
 
 # =============== MAIN EXECUTION =========================================================================================
 
@@ -469,16 +474,16 @@ if __name__ == "__main__":
     # 设置要处理的目录
     base_directories = [
         "/Users/dai/Desktop/fucci/20251003 f98 fucci-1",
-#        "/Users/dai/Desktop/fucci/20251003 f98 fucci-1 last line"
-#        "test1"
+        "/Users/dai/Desktop/fucci/20251003 f98 fucci-1 last line"
     ]
-    
-    # 设置输出Excel文件路径
-    output_excel_path = "/Users/dai/Desktop/fucci/cell_count_results-test.xlsx"
-    
+
     print("开始处理细胞计数...")
     print(f"处理目录: {base_directories}")
-    print(f"输出文件: {output_excel_path}")
+    print(f"逐帧 CSV 输出目录: {os.path.join(DEFAULT_MARKED_DIR, PER_FRAME_COUNTS_DIR_NAME)}")
+    if ENABLE_MARKED_OUTPUT:
+        print(f"标注栈输出目录: {DEFAULT_MARKED_DIR}")
+    else:
+        print("标注栈输出已关闭 (ENABLE_MARKED_OUTPUT=False)")
     
     # 确认执行
     ans = input("是否继续执行? (y/n): ")
@@ -487,5 +492,5 @@ if __name__ == "__main__":
         sys.exit()
     
     # 执行处理
-    process_folders(base_directories, output_excel_path)
+    process_folders(base_directories)
     print("处理完成！")
