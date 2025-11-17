@@ -45,6 +45,7 @@ merge_distance=3
 # 标注输出配置
 MARKED_STACK_SUFFIX="_marked"
 DEFAULT_MARKED_DIR=os.path.dirname(os.path.abspath(__file__))
+ENABLE_MARKED_OUTPUT=False  # 批量运行时可临时改为 False 以跳过生成 OME-TIFF
 
 
 # =============== HELPER FUNCTIONS =========================================================================================
@@ -137,11 +138,11 @@ def _create_marker_mask(shape, dtype, coords, marker):
     if marker == "circle":
         for center in coords:
             cx, cy = center
-            _draw_disk(mask, (cy, cx), radius=3, value=max_val)
+            _draw_disk(mask, (cy, cx), radius=5, value=max_val)
     else:
         for center in coords:
             cx, cy = center
-            _draw_cross(mask, (cy, cx), arm=4, value=max_val)
+            _draw_cross(mask, (cy, cx), arm=6, value=max_val)
     return mask
 
 
@@ -274,12 +275,14 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
 
         reader = bioformats.ImageReader(frame_file)
         base_name = os.path.splitext(os.path.basename(frame_file))[0]
-        marked_output_path = os.path.join(marked_output_dir, f"{base_name}{MARKED_STACK_SUFFIX}.ome.tif")
+        marked_output_path = None
         detection_channels = list(range(min(2, nchan)))
         total_channels = nchan + len(detection_channels)
         channel_names = [f"channel_{idx}_raw" for idx in range(nchan)] + [
             f"channel_{idx}_marks" for idx in detection_channels
         ]
+        if ENABLE_MARKED_OUTPUT:
+            marked_output_path = os.path.join(marked_output_dir, f"{base_name}{MARKED_STACK_SUFFIX}.ome.tif")
 
         for frame_idx in range(nt):
             try:
@@ -320,34 +323,35 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
                     f"-> merged(GFP,RFP)=({merged_counts['channel_0']}, {merged_counts['channel_1']}) | 总数={merged_total}"
                 )
 
-                if writer is None:
-                    reference_channel = 0 if 0 in frame_channel_arrays else next(iter(frame_channel_arrays))
-                    dtype = frame_channel_arrays[reference_channel].dtype
-                    writer = MarkedStackWriter(
-                        marked_output_path,
-                        frames=nt,
-                        total_channels=total_channels,
-                        image_shape=(Ny, Nx),
-                        dtype=dtype,
-                        channel_names=channel_names
-                    )
+                if ENABLE_MARKED_OUTPUT:
+                    if writer is None:
+                        reference_channel = 0 if 0 in frame_channel_arrays else next(iter(frame_channel_arrays))
+                        dtype = frame_channel_arrays[reference_channel].dtype
+                        writer = MarkedStackWriter(
+                            marked_output_path,
+                            frames=nt,
+                            total_channels=total_channels,
+                            image_shape=(Ny, Nx),
+                            dtype=dtype,
+                            channel_names=channel_names
+                        )
 
-                frame_planes = []
-                for channel_idx in range(nchan):
-                    frame_planes.append(frame_channel_arrays[channel_idx])
+                    frame_planes = []
+                    for channel_idx in range(nchan):
+                        frame_planes.append(frame_channel_arrays[channel_idx])
 
-                for channel_idx in detection_channels:
-                    coords = merged_coords.get(channel_idx, np.empty((0, 2)))
-                    marker = "cross" if channel_idx == 0 else "circle"
-                    mask = _create_marker_mask(
-                        frame_channel_arrays[channel_idx].shape,
-                        frame_channel_arrays[channel_idx].dtype,
-                        coords,
-                        marker
-                    )
-                    frame_planes.append(mask)
+                    for channel_idx in detection_channels:
+                        coords = merged_coords.get(channel_idx, np.empty((0, 2)))
+                        marker = "cross" if channel_idx == 0 else "circle"
+                        mask = _create_marker_mask(
+                            frame_channel_arrays[channel_idx].shape,
+                            frame_channel_arrays[channel_idx].dtype,
+                            coords,
+                            marker
+                        )
+                        frame_planes.append(mask)
 
-                writer.write(frame_planes)
+                    writer.write(frame_planes)
 
             except Exception as frame_err:
                 print(f"帧 {frame_idx} 处理异常: {frame_err}")
@@ -379,7 +383,10 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
             "frames": frames_summary,
             "marked_stack": marked_stack_path
         }
-        print(f"标注输出: {marked_stack_path if marked_stack_path else '未生成'}")
+        if ENABLE_MARKED_OUTPUT:
+            print(f"标注输出: {marked_stack_path if marked_stack_path else '未生成'}")
+        else:
+            print("标注输出: 已禁用 (ENABLE_MARKED_OUTPUT=False)")
         return result
 
     except Exception as e:
@@ -461,9 +468,9 @@ def calculate_and_save_statistics(results, output_excel_path):
 if __name__ == "__main__":
     # 设置要处理的目录
     base_directories = [
-#        "/Users/dai/Desktop/fucci/20251003 f98 fucci-1",
+        "/Users/dai/Desktop/fucci/20251003 f98 fucci-1",
 #        "/Users/dai/Desktop/fucci/20251003 f98 fucci-1 last line"
-        "test1"
+#        "test1"
     ]
     
     # 设置输出Excel文件路径
