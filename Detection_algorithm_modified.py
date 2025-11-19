@@ -48,6 +48,11 @@ ENABLE_MARKED_OUTPUT=False  # 批量运行时可临时改为 False 以跳过生�
 PER_FRAME_COUNTS_DIR_NAME="per_frame_counts"
 PER_FRAME_COUNTS_SUFFIX="_frame_counts.csv"
 
+# Puits 选择（行 A-D, 列 1-6 共 24 个）
+DEFAULT_PUITS = [f"{row}{col}" for row in "ABCD" for col in range(1, 7)]
+PUITS_SELECTION = {name: True for name in DEFAULT_PUITS}
+PUITS_SELECTION_ENABLED = False  # 设为 True 后仅处理在 PUITS_SELECTION 中标记 True 的 puits
+
 
 # =============== HELPER FUNCTIONS =========================================================================================
 
@@ -106,6 +111,12 @@ def _print_run_summary(records):
             f"  {puits}#{pos_str} | last(GFP,RFP)=({gfp}, {rfp}) | "
             f"counts: {counts_csv} | marked: {marked_stack}"
         )
+
+
+def _should_process_puits(puits):
+    if not PUITS_SELECTION_ENABLED:
+        return True
+    return PUITS_SELECTION.get(puits.upper(), False)
 
 
 def _detect_positions(data, background):
@@ -262,6 +273,9 @@ def process_folders(base_directories, output_excel_path=None):
                 puits, position = _extract_puits_position(folder_name)
                 if puits is None:
                     print(f"无法解析文件夹名称: {folder_name}")
+                    continue
+                if not _should_process_puits(puits):
+                    print(f"  跳过 {puits}#{position:02d} (PUITS_SELECTION) ")
                     continue
 
                 result = process_frame_file(frame_file)
@@ -473,7 +487,7 @@ def process_frame_file(frame_file, d_merge=merge_distance, marked_output_dir=Non
 if __name__ == "__main__":
     # 设置要处理的目录
     base_directories = [
-        "/Users/dai/Desktop/fucci/20251003 f98 fucci-1",
+#        "/Users/dai/Desktop/fucci/20251003 f98 fucci-1",
         "/Users/dai/Desktop/fucci/20251003 f98 fucci-1 last line"
     ]
 
@@ -484,6 +498,11 @@ if __name__ == "__main__":
         print(f"标注栈输出目录: {DEFAULT_MARKED_DIR}")
     else:
         print("标注栈输出已关闭 (ENABLE_MARKED_OUTPUT=False)")
+    if PUITS_SELECTION_ENABLED:
+        enabled_puits = sorted([p for p, flag in PUITS_SELECTION.items() if flag])
+        print(f"启用 Puits 过滤，处理中: {', '.join(enabled_puits)}")
+    else:
+        print("Puits 过滤未启用，默认处理全部 24 个位置")
     
     # 确认执行
     ans = input("是否继续执行? (y/n): ")
