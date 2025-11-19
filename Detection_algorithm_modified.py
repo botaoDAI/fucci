@@ -4,6 +4,7 @@
 # 复用原 SEP→LoG→局部极大值参数，对每个 ets 的所有时间帧和前两个荧光通道进行计数
 # 最新改动：取消 Excel 汇总，新增逐帧 CSV（按 `_Image_*` 解析出的 A1_01 等编号命名），处理流程重构为
 #   _iter_stack_files + process_frame_file 的双层结构并提供控制台汇总；按需生成 FIJI 友好的 *_marked.ome.tif
+#   支持 PUITS_SELECTION 过滤，当前实验默认排除 D1、D3 的 9 张图像
 
 # =============== REQUIRED PACKAGES =========================================================================================
 
@@ -50,8 +51,9 @@ PER_FRAME_COUNTS_SUFFIX="_frame_counts.csv"
 
 # Puits 选择（行 A-D, 列 1-6 共 24 个）
 DEFAULT_PUITS = [f"{row}{col}" for row in "ABCD" for col in range(1, 7)]
-PUITS_SELECTION = {name: True for name in DEFAULT_PUITS}
-PUITS_SELECTION_ENABLED = False  # 设为 True 后仅处理在 PUITS_SELECTION 中标记 True 的 puits
+EXCLUDED_PUITS = {"D1", "D3"}
+PUITS_SELECTION = {name: (name.upper() not in EXCLUDED_PUITS) for name in DEFAULT_PUITS}
+PUITS_SELECTION_ENABLED = True  # 当前实验排除 D1/D3，改为 False 可重新处理全部 puits
 
 
 # =============== HELPER FUNCTIONS =========================================================================================
